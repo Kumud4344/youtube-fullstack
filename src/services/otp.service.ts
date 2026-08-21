@@ -14,6 +14,7 @@ import type { Types } from "mongoose";
 function generateNumericOtp(length: number): string {
   const max = 10 ** length;
   const value = randomInt(0, max);
+
   return value.toString().padStart(length, "0");
 }
 
@@ -26,8 +27,10 @@ export async function createAndSendOtp(params: {
   forceChannel?: OtpChannel;
 }) {
   const env = getEnv();
+
   const channel =
-    params.forceChannel ?? resolveOtpChannel(params.state ?? undefined);
+    params.forceChannel ??
+    resolveOtpChannel(params.state ?? undefined);
 
   if (channel === OTP_CHANNELS.MOBILE && !params.phone) {
     throw new AppError(
@@ -38,7 +41,9 @@ export async function createAndSendOtp(params: {
   }
 
   const destination =
-    channel === OTP_CHANNELS.EMAIL ? params.email : (params.phone as string);
+    channel === OTP_CHANNELS.EMAIL
+      ? params.email
+      : (params.phone as string);
 
   await OTPVerification.updateMany(
     {
@@ -46,13 +51,25 @@ export async function createAndSendOtp(params: {
       purpose: params.purpose,
       consumedAt: null,
     },
-    { $set: { consumedAt: new Date() } },
+    {
+      $set: {
+        consumedAt: new Date(),
+      },
+    },
   );
 
+  // Generate OTP
   const otp = generateNumericOtp(env.OTP_LENGTH);
-  const otpHash = await hashOtp(otp);
-  const expiresAt = new Date(Date.now() + env.OTP_EXPIRES_MINUTES * 60_000);
 
+  // Hash OTP before storing it in database
+  const otpHash = await hashOtp(otp);
+
+  // OTP expiry time
+  const expiresAt = new Date(
+    Date.now() + env.OTP_EXPIRES_MINUTES * 60_000,
+  );
+
+  // Create OTP challenge
   const challenge = await OTPVerification.create({
     userId: params.userId,
     channel,
@@ -64,28 +81,61 @@ export async function createAndSendOtp(params: {
     expiresAt,
   });
 
+  // Message that would normally be sent through SMS/email
   const message = `Your Vidora verification code is ${otp}. It expires in ${env.OTP_EXPIRES_MINUTES} minutes.`;
 
+  // Send through email provider
   if (channel === OTP_CHANNELS.EMAIL) {
     await getEmailProvider().send({
       to: destination,
       subject: "Your Vidora verification code",
       text: message,
-      html: `<p>Your Vidora verification code is <strong>${otp}</strong>.</p><p>It expires in ${env.OTP_EXPIRES_MINUTES} minutes.</p>`,
+      html: `
+        <p>
+          Your Vidora verification code is
+          <strong>${otp}</strong>.
+        </p>
+        <p>
+          It expires in ${env.OTP_EXPIRES_MINUTES} minutes.
+        </p>
+      `,
     });
   } else {
+    // Send through SMS provider
     await getSmsProvider().send({
       to: destination,
       message,
     });
   }
 
-  if (env.NODE_ENV !== "production") {
-    // Structured logger redacts `otp`; print plainly for local testing only.
+  /*
+   * DEMO OTP MODE
+   *
+   * Your Netlify project uses:
+   *
+   * SMS_MODE=mock
+   * EMAIL_MODE=development
+   *
+   * Therefore we allow the OTP to be returned to the
+   * frontend so that you can see it on the verification
+   * page without needing a real SMS/email service.
+   *
+   * IMPORTANT:
+   * When you connect a real SMS/email provider later,
+   * change these modes and the OTP will no longer
+   * be returned.
+   */
+  const isDemoOtp =
+    env.NODE_ENV !== "production" ||
+    env.SMS_MODE === "mock" ||
+    env.EMAIL_MODE === "development";
+
+  if (isDemoOtp) {
     console.info(
-      `[Vidora DEV] OTP for ${channel} ${destination}: ${otp} (challenge ${challenge._id.toString()})`,
+      `[Vidora DEMO] OTP for ${channel} ${destination}: ${otp} (challenge ${challenge._id.toString()})`,
     );
-    logger.info("OTP issued in non-production mode", {
+
+    logger.info("OTP issued in demo mode", {
       challengeId: challenge._id.toString(),
       channel,
       destination,
@@ -95,23 +145,42 @@ export async function createAndSendOtp(params: {
   return {
     challengeId: challenge._id.toString(),
     channel,
-    destinationHint: maskDestination(destination, channel),
+    destinationHint: maskDestination(
+      destination,
+      channel,
+    ),
     expiresAt: expiresAt.toISOString(),
-    debugOtp: env.NODE_ENV !== "production" ? otp : undefined,
+
+    // This is what the verification page uses
+    // to display the OTP during demo/testing.
+    debugOtp: isDemoOtp ? otp : undefined,
   };
 }
 
 export async function verifyOtpChallenge(params: {
   challengeId: string;
   otp: string;
-  purpose?: "LOGIN" | "REGISTER" | "RESET_PASSWORD" | "VERIFY_CONTACT";
+  purpose?:
+    | "LOGIN"
+    | "REGISTER"
+    | "RESET_PASSWORD"
+    | "VERIFY_CONTACT";
 }) {
-  const challenge = await OTPVerification.findById(params.challengeId).select(
-    "+otpHash",
-  );
+  const challenge =
+    await OTPVerification.findById(
+      params.challengeId,
+    ).select("+otpHash");
 
-  if (!challenge || (params.purpose && challenge.purpose !== params.purpose)) {
-    throw new AppError(ERROR_CODES.OTP_INVALID, "Invalid OTP challenge.", 400);
+  if (
+    !challenge ||
+    (params.purpose &&
+      challenge.purpose !== params.purpose)
+  ) {
+    throw new AppError(
+      ERROR_CODES.OTP_INVALID,
+      "Invalid OTP challenge.",
+      400,
+    );
   }
 
   if (challenge.consumedAt) {
@@ -122,7 +191,10 @@ export async function verifyOtpChallenge(params: {
     );
   }
 
-  if (challenge.expiresAt.getTime() < Date.now()) {
+  if (
+    challenge.expiresAt.getTime() <
+    Date.now()
+  ) {
     throw new AppError(
       ERROR_CODES.OTP_EXPIRED,
       "OTP has expired. Please request a new one.",
@@ -130,7 +202,10 @@ export async function verifyOtpChallenge(params: {
     );
   }
 
-  if (challenge.attempts >= challenge.maxAttempts) {
+  if (
+    challenge.attempts >=
+    challenge.maxAttempts
+  ) {
     throw new AppError(
       ERROR_CODES.OTP_LIMIT_EXCEEDED,
       "Too many invalid OTP attempts.",
@@ -138,27 +213,52 @@ export async function verifyOtpChallenge(params: {
     );
   }
 
-  const valid = await verifyOtpHash(params.otp, challenge.otpHash);
+  const valid = await verifyOtpHash(
+    params.otp,
+    challenge.otpHash,
+  );
+
   if (!valid) {
     challenge.attempts += 1;
+
     await challenge.save();
-    throw new AppError(ERROR_CODES.OTP_INVALID, "Invalid OTP.", 400);
+
+    throw new AppError(
+      ERROR_CODES.OTP_INVALID,
+      "Invalid OTP.",
+      400,
+    );
   }
 
   challenge.consumedAt = new Date();
+
   await challenge.save();
 
   return challenge;
 }
 
-function maskDestination(destination: string, channel: OtpChannel): string {
+function maskDestination(
+  destination: string,
+  channel: OtpChannel,
+): string {
   if (channel === OTP_CHANNELS.EMAIL) {
-    const [local, domain] = destination.split("@");
-    if (!domain) return "***";
+    const [local, domain] =
+      destination.split("@");
+
+    if (!domain) {
+      return "***";
+    }
+
     const visible = local.slice(0, 2);
+
     return `${visible}***@${domain}`;
   }
 
-  if (destination.length <= 4) return "****";
-  return `${"*".repeat(Math.max(destination.length - 4, 0))}${destination.slice(-4)}`;
+  if (destination.length <= 4) {
+    return "****";
+  }
+
+  return `${"*".repeat(
+    Math.max(destination.length - 4, 0),
+  )}${destination.slice(-4)}`;
 }
